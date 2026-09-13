@@ -1,4 +1,4 @@
 # Generated/synthetic backtest data and real trading logs - regenerate or
 # supply your own; not committed (real logs especially shouldn't be).
-backtest/*.jsonl
+backtest/**/*.jsonl
 __pycache__/
