@@ -1,53 +1,62 @@
 # Lanes strategy — what's real vs. guessed
 
-This backtest was built with **no jsonl logs, AHK scripts, `server.ps1`, or
-`dashboard.html` present anywhere in the repo or container** — the repo had
-zero commits. The AHK script pasted into the task request was used as the
-source of truth for "real" config values (it's your actual working bot);
-everything about the "lanes" strategy itself comes from three secondhand
-quotes with no code, thresholds, or counts attached. This file draws the
-line between the two so you know exactly what to trust.
+This backtest was originally built with zero jsonl logs available (empty
+repo). It has since been run against your 5 real log files covering
+2026-09-12 15:00 UTC → 2026-09-13 01:00 UTC (10 hours, BTC/ETH/SOL, ~40
+fifteen-minute sessions per asset). This file draws the line between what
+came directly from the trading-chat quotes, what's now confirmed from your
+real data, and what's still a guess.
 
 ## Directly from the quotes (real, not guessed)
 
 - **Two-check delta confirmation**: entries require delta to be moving
   away from a reference line, confirmed on *two* consecutive checks before
-  firing. ("It checks it twice ... If it gets two confirmations, then it
-  triggers.")
-- **Lanes are OR'd, not AND'd**: any one lane firing is sufficient; a
-  market that fails lane A can still be entered via lane B. ("It doesn't
-  have to meet all the triggers, each lane is its own.")
+  firing.
+- **Lanes are OR'd, not AND'd**: any one lane firing is sufficient.
 - **Selectivity**: normally enters ~20-30% of markets, roughly once every
-  1.5-2 hours; a choppy day with tight deltas can push that much lower
-  (only twice in a day, per the quote).
-- **No stoploss by default; hold to resolution.** Explicitly stated as
-  more profitable in their own testing and cited as a fee-savings
-  mechanism.
+  1.5-2 hours; choppy days can push that much lower.
+- **No stoploss by default; hold to resolution.**
 
-## Guessed / placeholder (flagged in code, tune freely)
+## Confirmed from your real jsonl logs (no longer guesses)
 
-| Item | What was guessed | Where |
+- **Schema**: each line is a poll snapshot — `timestampUtc` plus an
+  `assets` array of `{assetName, marketName, marketCloseUtc, upPrice,
+  downPrice, underlyingOpen, underlyingCurrent}`. `engine.py` parses this
+  directly now (the old alias-guessing loader was replaced).
+- **"Target line" = `underlyingOpen`**: confirmed to exist exactly as
+  guessed, and it updates tick-to-tick rather than being frozen at session
+  start (it visibly moved ~$1.50 within the first 2 seconds of a session
+  in your data) — so the lane compares against whatever open value was
+  reported at that instant, matching how the live bot would see it.
+- **No settlement field exists in the logs.** Kalshi's 15-minute up/down
+  markets settle by comparing the underlying price at close to the price
+  at open, so `engine.py` derives settlement as: `underlyingCurrent` at
+  the session's last observed tick vs. `underlyingOpen` at its first
+  observed tick. Sessions truncated at the very start/end of your log
+  window (no full lifecycle captured) are excluded from stats rather than
+  guessed at — 3 of 123 sessions in your 5 files.
+
+## Guessed / placeholder — now backed by real calibration data
+
+| Item | What was guessed | Real-data finding |
 |---|---|---|
-| `step_threshold` | The magnitude of delta growth needed per confirmation step. **No value was ever given.** Currently a placeholder tuned only to land the *synthetic demo data* in the 20-30%/1.5-2h ballpark — it has no bearing on your real markets. | `lanes.py`, CLI `--step-threshold` |
-| "Target line" definition | Interpreted as the 15-minute open/reference price, matching the `Delta := abs(open15m - live)` calc already in your AHK script. Could instead mean a strike price, a moving average, or something else entirely. | `lanes.py` docstring |
-| Delta units | Measured as **percentage of open price** ((live − open) / open) rather than a raw dollar amount, so one threshold works across assets of very different price scales (BTC ≈ $65k vs. DOGE ≈ $0.08). Your AHK `Delta` setting is raw-dollar and per-asset; this is a deliberate deviation, not a confirmed match. | `lanes.py` |
-| `min_abs_delta` noise floor | Defaults to 0 (inactive) — nothing in the quotes implies a floor exists. | `lanes.py`, CLI `--min-abs-delta` |
-| Entry window | Reused your AHK `timeDelay` (last 8 minutes of the 15m market) since the quotes never mention a window at all. | `run_backtest.py` `--entry-window-min` |
-| Position size | Reused your AHK `orderSize` (30 contracts) — this is your real config value, just not confirmed to apply to the lanes system. | `run_backtest.py` `--order-size` |
-| Other lanes (#2, #3, ...) | **Completely unknown.** No count, no logic. Only lane #1 (delta confirmation) is implemented. The framework in `lanes.py` is built so you can add more `Lane` subclasses later without touching the engine. | `lanes.py` `default_lanes()` |
-| jsonl schema | No log file existed to inspect. `engine.py`'s `ALIASES` dict is a best-effort guess based on field names already used in your AHK script (`up`, `down`, `open15m`, live price, `minutesLeft`, ticker). **This almost certainly needs correcting once you supply real logs.** | `engine.py` |
-| Settlement source | No settlement field was known to exist, so the engine first looks for one (`settlement`/`result`/`outcome`), and falls back to inferring from ask prices converging to ~0 or ~1 near market close. | `engine.py` `_resolve_settlement()` |
+| `step_threshold` (delta % growth per confirmation step) | No value was ever given. | **Asset-dependent — a single threshold does not transfer.** At `2e-5` (0.002%): BTC → 15% entries, 1 every 1.67h (closest match to the 20-30%/1.5-2h target). ETH is far more volatile — the same threshold gives 37.5% at nearly 3x the frequency; matching ETH to the same target needs ~4-5e-5. SOL barely moved enough to trigger at any threshold tested (1 entry all day at nearly every setting) — either SOL chopped much less that day, or its price granularity doesn't suit this delta measure. **Calibrate per-asset with `--sweep --asset <NAME>`.** |
+| Delta units | Guessed as % of open price rather than raw dollars, for cross-asset comparability. | Confirmed necessary — BTC (~$77k) and SOL (~$102) real prices in this data differ by ~750x; a raw-dollar threshold could never work for both. |
+| Entry price / lateness bound | Not mentioned in the quotes at all. | **This matters.** With no cap, 2 of 6 BTC entries fired with ~12 seconds left in the market at prices of 0.996/0.999 — the outcome was already essentially decided, so the "win" was a few cents on a near-zero-edge bet, not a real predictive entry. This inflates win rate. Added `--max-entry-price` as an opt-in cap (inactive by default = 1.0, matching "nothing said about this in the quotes"). At `--max-entry-price 0.85` (borrowing your own AHK EntryRange upper bound as a reference point, not a confirmed match) BTC drops to 2 entries/5.0%/1-per-5h — too strict to hit the target on this single day, but removes the degenerate late entries. There's a real tradeoff here between hitting the quoted frequency and avoiding degenerate entries that your one day of data doesn't fully resolve either way. |
+| Other lanes (#2, #3, ...) | Completely unknown. | Still completely unknown — only lane #1 is implemented. |
+| Position size / entry window | Reused your AHK `orderSize`=30 and `timeDelay`=8min. | Unchanged — still your real config values, not confirmed to apply to lanes specifically. |
 
-## Bottom line
+## Bottom line / how to read the numbers below
 
-Every number this backtest currently reports comes from a **400-session
-synthetic random-walk dataset** (`generate_sample_data.py`) generated only
-to prove the pipeline runs end-to-end — entry-fires-on-any-lane, two-check
-confirmation, hold-to-resolution settlement, PnL accounting. It is not
-your market, not your data, and the ~92% win rate it shows is an artifact
-of how the synthetic trend/settlement was constructed, not a real result.
-
-**To get real numbers**: send/push your actual jsonl logs, tell Claude the
-real field names if they differ from `engine.py`'s `ALIASES`, and re-run
-`run_backtest.py --sweep` against them to calibrate `step_threshold` for
-real.
+- The "20-30% of markets / once per 1.5-2h" target is hard to hit exactly
+  on a *single day* of data for a *single asset* — with only 40 sessions
+  for BTC, each percentage point is 0.4 sessions, so precision is limited.
+  The source's own quote acknowledges today-style chop can suppress hits
+  well below normal ("today ... it has only jumped in twice").
+- Treat the reported win rate/PnL as **directional, not final** — one
+  session's PnL swings a lot on a 6-trade sample, and the late-entry issue
+  above means some of that win rate is close-to-certain outcomes rather
+  than genuine edge.
+- More days of logs (especially calmer, more "normal" days per the
+  source's own framing) would materially tighten the threshold
+  calibration and make the win rate/PnL numbers trustworthy.

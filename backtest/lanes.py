@@ -78,13 +78,21 @@ class TwoCheckDeltaConfirmationLane(Lane):
         parameter requested in the task; start conservative and adjust
         once you can compare against real fills.
       - `min_abs_delta` - an optional noise floor, defaults to inactive.
+      - `max_entry_price` - NOT from the quotes, defaults to inactive
+        (1.0). Backtesting against real logs showed this lane can fire
+        with only seconds left at prices of 0.99+ (the outcome is already
+        essentially decided) - that inflates win rate on a near-zero-edge
+        bet. Nothing in the source description bounds entry price or
+        lateness, so this is an opt-in cap you can set, not a default
+        behavior.
     """
 
     name = "two_check_delta_confirmation"
 
-    def __init__(self, step_threshold: float, min_abs_delta: float = 0.0):
+    def __init__(self, step_threshold: float, min_abs_delta: float = 0.0, max_entry_price: float = 1.0):
         self.step_threshold = step_threshold      # GUESS / tunable
         self.min_abs_delta = min_abs_delta         # GUESS / tunable
+        self.max_entry_price = max_entry_price     # NOT from source / opt-in cap
 
     def check(self, history: List[Tick]) -> Optional[LaneSignal]:
         if len(history) < 3:
@@ -115,6 +123,8 @@ class TwoCheckDeltaConfirmationLane(Lane):
         entry_price = latest.up if side == "UP" else latest.down
         if entry_price is None:
             return None
+        if entry_price > self.max_entry_price:
+            return None
 
         return LaneSignal(
             lane=self.name,
@@ -126,7 +136,7 @@ class TwoCheckDeltaConfirmationLane(Lane):
         )
 
 
-def default_lanes(step_threshold: float, min_abs_delta: float = 0.0) -> List[Lane]:
+def default_lanes(step_threshold: float, min_abs_delta: float = 0.0, max_entry_price: float = 1.0) -> List[Lane]:
     """
     Registry of active lanes, checked in order. The engine fires on the
     FIRST lane that returns a signal - since only one lane is implemented,
@@ -137,5 +147,6 @@ def default_lanes(step_threshold: float, min_abs_delta: float = 0.0) -> List[Lan
     lanes should check, so none are included by default.
     """
     return [
-        TwoCheckDeltaConfirmationLane(step_threshold=step_threshold, min_abs_delta=min_abs_delta),
+        TwoCheckDeltaConfirmationLane(step_threshold=step_threshold, min_abs_delta=min_abs_delta,
+                                       max_entry_price=max_entry_price),
     ]

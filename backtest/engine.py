@@ -1,68 +1,51 @@
 """
 Backtest engine for the NightShark "lanes" entry strategy.
 
-Reads logged Kalshi 15-minute market ticks from a .jsonl file (one JSON
-object per line), groups them into per-market sessions by ticker, restricts
-entries to a "last N minutes" window (matches the `timeDelay` window your
-AHK script already uses), runs the lane framework (lanes.py) tick-by-tick,
-and by default holds every position to resolution - no stoploss - per:
+Reads logged Kalshi 15-minute market ticks from one or more .jsonl files
+(one JSON object per line, each line a poll snapshot across all tracked
+assets), groups them into per-market sessions by ticker (marketName),
+restricts entries to a "last N minutes" window (matches the `timeDelay`
+window your AHK script already uses), runs the lane framework (lanes.py)
+tick-by-tick, and by default holds every position to resolution - no
+stoploss - per:
 
     "Not often [use a stoploss]. From all the tests I have run, it seems
     like holding to resolution is more profitable even if you have a few
     more losses... holding to resolution saves a ton on fees."
 
-IMPORTANT: no server.ps1, dashboard.html, or *.jsonl logs existed anywhere
-in this repo/container when this was built (the repo had zero commits).
-ALIASES below is a best-effort GUESS at your real field names, based only
-on the variable names already used in your AHK script (up, down, open15m,
-live price, minutesLeft, ticker). If your actual jsonl uses different keys,
-either tell Claude the real schema or add the key names to ALIASES.
+Real log schema (confirmed from your uploaded price-data files):
+
+    {"timestamp": "...", "timestampUtc": "2026-09-12T15:00:00Z",
+     "assets": [
+        {"assetName": "BTC", "marketName": "KXBTC15M-26SEP121115-15",
+         "marketCloseUtc": "2026-09-12T15:15:00Z",
+         "upPrice": 0.55, "downPrice": 0.46,
+         "underlyingOpen": 77444.20, "underlyingCurrent": 77445.51},
+        ... one object per tracked asset ...
+     ]}
+
+There is no explicit settlement/result field. Kalshi's 15-minute
+up/down-vs-open markets settle based on whether the underlying price at
+close is above or below the price at open, so settlement is DERIVED here
+as: underlyingCurrent at the session's last observed tick vs.
+underlyingOpen at the session's first observed tick. See
+`_resolve_settlement` and ASSUMPTIONS.md for the caveats (mainly: sessions
+truncated at the very start/end of your log window don't have a full
+lifecycle and are excluded from stats rather than guessed at).
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from lanes import Tick, default_lanes
 
-# --- GUESSED field-name aliases: edit to match your real jsonl -------------
-ALIASES = {
-    "ts":           ["ts", "timestamp", "time", "t"],
-    "asset":        ["asset", "symbol"],
-    "ticker":       ["ticker", "market_ticker", "marketTicker"],
-    "up":           ["up", "yes_ask", "yes_price", "up_price"],
-    "down":         ["down", "no_ask", "no_price", "down_price"],
-    "live_price":   ["live_price", "livePrice", "price", "underlying_price"],
-    "open_price":   ["open_price", "open15m", "open", "openPrice"],
-    "minutes_left": ["minutes_left", "minutesLeft", "mins_left"],
-    "settlement":   ["settlement", "result", "outcome"],
-}
 
-
-def _get(rec: dict, key: str):
-    for alias in ALIASES[key]:
-        if alias in rec and rec[alias] not in (None, ""):
-            return rec[alias]
-    return None
-
-
-def _num(v) -> Optional[float]:
+def _parse_iso(s: str) -> Optional[float]:
     try:
-        return float(v) if v is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_epoch(v) -> Optional[float]:
-    if v is None:
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    try:
-        s = str(v).replace("Z", "+00:00")
-        return datetime.fromisoformat(s).timestamp()
-    except ValueError:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
         return None
 
 
@@ -70,91 +53,128 @@ def _to_epoch(v) -> Optional[float]:
 class SessionResult:
     ticker: str
     asset: str
+    complete: bool = False              # full lifecycle observed (see _resolve_settlement)
     entered: bool = False
     lane: Optional[str] = None
     side: Optional[str] = None
     entry_price: Optional[float] = None
     entry_ts: Optional[float] = None
-    settlement: Optional[int] = None            # 1 = UP/YES won, 0 = DOWN/NO won
-    settlement_source: Optional[str] = None     # "explicit" or "inferred_converged_price"
+    settlement: Optional[int] = None    # 1 = UP/YES won, 0 = DOWN/NO won
     exit_price: Optional[float] = None
     pnl: Optional[float] = None
     exit_reason: Optional[str] = None
 
 
-def load_sessions(path: str) -> Dict[str, List[dict]]:
-    sessions: Dict[str, List[dict]] = {}
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ticker = _get(rec, "ticker") or "unknown"
-            sessions.setdefault(ticker, []).append(rec)
+@dataclass
+class _RawSession:
+    asset: str
+    ticks: List[Tuple[float, dict]] = field(default_factory=list)   # (ts_epoch, fields)
+
+
+def iter_asset_records(paths: List[str]):
+    """Yields (ticker, asset, ts_epoch, fields) for every asset entry in
+    every line of every file, in the file order given (pass files in
+    chronological order for multi-file logs)."""
+    for path in paths:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts_raw = rec.get("timestampUtc") or rec.get("timestamp")
+                if not ts_raw:
+                    continue
+                ts = _parse_iso(ts_raw)
+                if ts is None:
+                    continue
+                for a in rec.get("assets", []):
+                    ticker = a.get("marketName")
+                    if not ticker:
+                        continue
+                    close_raw = a.get("marketCloseUtc")
+                    close_ts = _parse_iso(close_raw) if close_raw else None
+                    minutes_left = (close_ts - ts) / 60.0 if close_ts is not None else None
+                    yield ticker, (a.get("assetName") or "?"), ts, {
+                        "up": a.get("upPrice"),
+                        "down": a.get("downPrice"),
+                        "open": a.get("underlyingOpen"),
+                        "current": a.get("underlyingCurrent"),
+                        "minutes_left": minutes_left,
+                    }
+
+
+def load_sessions(paths: List[str]) -> Dict[str, _RawSession]:
+    sessions: Dict[str, _RawSession] = {}
+    for ticker, asset, ts, fields in iter_asset_records(paths):
+        sess = sessions.setdefault(ticker, _RawSession(asset=asset))
+        sess.ticks.append((ts, fields))
+    for sess in sessions.values():
+        sess.ticks.sort(key=lambda x: x[0])
     return sessions
 
 
-def _build_ticks(records: List[dict]) -> Tuple[List[Tick], str]:
-    ticks = []
-    for rec in records:
-        ts = _to_epoch(_get(rec, "ts")) or 0.0
-        ticks.append(Tick(
+def _to_ticks(raw: _RawSession) -> List[Tick]:
+    return [
+        Tick(
             ts=ts,
-            minutes_left=_num(_get(rec, "minutes_left")),
-            up=_num(_get(rec, "up")),
-            down=_num(_get(rec, "down")),
-            live_price=_num(_get(rec, "live_price")),
-            open_price=_num(_get(rec, "open_price")),
-        ))
-    ticks.sort(key=lambda t: t.ts)
-    asset = _get(records[0], "asset") or "?"
-    return ticks, asset
+            minutes_left=fields["minutes_left"],
+            up=fields["up"],
+            down=fields["down"],
+            live_price=fields["current"],
+            open_price=fields["open"],
+        )
+        for ts, fields in raw.ticks
+    ]
 
 
-def _resolve_settlement(records: List[dict], ticks: List[Tick]) -> Tuple[Optional[int], Optional[str]]:
-    """Prefer an explicit settlement field; otherwise infer from ask
-    prices converging to 0/1 near resolution (how binary markets behave
-    as they close). Returns (1=UP/YES won, 0=DOWN/NO won) or (None, None)
-    if it can't be determined either way."""
-    for rec in records:
-        raw = _get(rec, "settlement")
-        if raw is not None:
-            s = str(raw).strip().lower()
-            if s in ("yes", "up", "1", "true"):
-                return 1, "explicit"
-            if s in ("no", "down", "0", "false"):
-                return 0, "explicit"
+# A session is "complete" if the log actually captured its full lifecycle:
+# starts near a fresh 15-minute window and ends near expiry. Sessions
+# truncated at the very start/end of the supplied log files don't have a
+# real open or a real close in the data, so they're excluded from
+# win-rate/PnL stats rather than guessed at.
+COMPLETE_START_MIN_LEFT = 13.5   # first tick must show close to the full 15m left
+COMPLETE_END_MAX_LEFT = 0.5      # last tick must show close to 0m left
 
-    for t in reversed(ticks):
-        if t.up is not None and t.up >= 0.99:
-            return 1, "inferred_converged_price"
-        if t.down is not None and t.down >= 0.99:
-            return 0, "inferred_converged_price"
-    return None, None
+
+def _resolve_settlement(ticks: List[Tick]) -> Tuple[bool, Optional[int]]:
+    minutes = [t.minutes_left for t in ticks if t.minutes_left is not None]
+    if not minutes:
+        return False, None
+    complete = (max(minutes) >= COMPLETE_START_MIN_LEFT) and (min(minutes) <= COMPLETE_END_MAX_LEFT)
+    if not complete:
+        return False, None
+
+    open_price = next((t.open_price for t in ticks if t.open_price is not None), None)
+    close_price = next((t.live_price for t in reversed(ticks) if t.live_price is not None), None)
+    if open_price is None or close_price is None or close_price == open_price:
+        return complete, None
+    return complete, 1 if close_price > open_price else 0
 
 
 def run_backtest(
-    path: str,
+    paths: List[str],
     entry_window_minutes: float,
     step_threshold: float,
     order_size: float,
     stoploss: Optional[float] = None,   # None = hold-to-resolution (the default per source quotes)
     min_abs_delta: float = 0.0,
+    max_entry_price: float = 1.0,       # NOT from source / opt-in cap, see lanes.py
 ) -> List[SessionResult]:
-    sessions = load_sessions(path)
+    raw_sessions = load_sessions(paths)
     results: List[SessionResult] = []
 
-    for ticker, records in sessions.items():
-        ticks, asset = _build_ticks(records)
+    for ticker, raw in raw_sessions.items():
+        ticks = _to_ticks(raw)
         if not ticks:
             continue
 
-        result = SessionResult(ticker=ticker, asset=asset)
-        lanes = default_lanes(step_threshold, min_abs_delta)
+        complete, settlement = _resolve_settlement(ticks)
+        result = SessionResult(ticker=ticker, asset=raw.asset, complete=complete, settlement=settlement)
+        lanes = default_lanes(step_threshold, min_abs_delta, max_entry_price)
         history: List[Tick] = []
         entered_side: Optional[str] = None
 
@@ -183,41 +203,25 @@ def run_backtest(
                     entered_side = "closed"
                     break
 
-        if result.entered and result.exit_price is None:
-            settlement, source = _resolve_settlement(records, ticks)
-            result.settlement = settlement
-            result.settlement_source = source
-            if settlement is not None:
-                exit_price = 1.0 if (
-                    (result.side == "UP" and settlement == 1) or
-                    (result.side == "DOWN" and settlement == 0)
-                ) else 0.0
-                result.exit_price = exit_price
-                result.pnl = (exit_price - result.entry_price) * order_size
-                result.exit_reason = "held_to_resolution"
+        if result.entered and result.exit_price is None and complete and settlement is not None:
+            exit_price = 1.0 if (
+                (result.side == "UP" and settlement == 1) or
+                (result.side == "DOWN" and settlement == 0)
+            ) else 0.0
+            result.exit_price = exit_price
+            result.pnl = (exit_price - result.entry_price) * order_size
+            result.exit_reason = "held_to_resolution"
 
         results.append(result)
 
     return results
 
 
-def log_span_hours(path: str) -> Optional[float]:
-    """Wall-clock span covered by the whole log file, for entry-cadence stats."""
+def log_span_hours(paths: List[str]) -> Optional[float]:
     min_ts, max_ts = None, None
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ts = _to_epoch(_get(rec, "ts"))
-            if ts is None:
-                continue
-            min_ts = ts if min_ts is None else min(min_ts, ts)
-            max_ts = ts if max_ts is None else max(max_ts, ts)
+    for _, _, ts, _ in iter_asset_records(paths):
+        min_ts = ts if min_ts is None else min(min_ts, ts)
+        max_ts = ts if max_ts is None else max(max_ts, ts)
     if min_ts is None or max_ts is None or max_ts <= min_ts:
         return None
     return (max_ts - min_ts) / 3600.0
